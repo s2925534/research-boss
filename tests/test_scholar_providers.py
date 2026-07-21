@@ -6,6 +6,7 @@ from urllib.request import Request
 
 import pytest
 
+import corroborly.engine.scholar_providers as scholar_providers
 from corroborly.engine.scholar_providers import (
     ScholarDataService,
     ScholarProviderError,
@@ -16,7 +17,28 @@ from corroborly.engine.scholar_providers import (
     _fetch_scholarly,
     _fetch_semantic_scholar,
     _fetch_serpapi,
+    read_serpapi_usage,
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolated_serpapi_usage_path(monkeypatch, tmp_path):
+    # SerpApi usage tracking is deliberately account-wide, not workspace-scoped
+    # (see scholar_providers.serpapi_usage_path), so every test here must
+    # redirect it to an isolated tmp_path file -- otherwise these tests would
+    # read/write the real ~/.corroborly/serpapi-usage.yaml.
+    monkeypatch.setenv("CORROBORLY_SERPAPI_USAGE_PATH", str(tmp_path / "serpapi-usage.yaml"))
+
+
+@pytest.fixture(autouse=True)
+def _no_real_dotenv_leak(monkeypatch):
+    # _env_value() reads Path.cwd()/.env in addition to os.environ, and tests
+    # run with cwd == the repo root, which has a real .env with real secrets
+    # (SERPAPI_API_KEY included). Without this, monkeypatch.delenv("...", ...)
+    # alone doesn't actually simulate "key absent" -- the real .env value
+    # leaks straight through. Stub the dotenv read so only os.environ
+    # (which individual tests control via monkeypatch.setenv/delenv) matters.
+    monkeypatch.setattr(scholar_providers, "load_dotenv_values", lambda _path: {})
 
 
 class FakeResponse:
@@ -116,6 +138,60 @@ def test_serpapi_raises_on_http_error(monkeypatch, tmp_path):
     exc = HTTPError("url", 429, "Too Many Requests", None, None)
     with pytest.raises(ScholarProviderError, match="HTTP 429"):
         _fetch_serpapi("q", 5, workspace=tmp_path, opener=_raising_opener(exc))
+
+
+def test_serpapi_usage_starts_at_zero(tmp_path):
+    usage = read_serpapi_usage()
+    assert usage.call_count == 0
+    assert usage.monthly_limit == 250
+    assert usage.remaining == 250
+    assert usage.limit_reached is False
+
+
+def test_serpapi_usage_increments_on_successful_round_trip(monkeypatch, tmp_path):
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+    _fetch_serpapi("q", 5, workspace=tmp_path, opener=_opener({"organic_results": []}))
+    assert read_serpapi_usage().call_count == 1
+    _fetch_serpapi("q2", 5, workspace=tmp_path, opener=_opener({"organic_results": []}))
+    assert read_serpapi_usage().call_count == 2
+
+
+def test_serpapi_usage_increments_even_on_serpapi_error_payload(monkeypatch, tmp_path):
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+    with pytest.raises(ScholarProviderError, match="SerpApi error"):
+        _fetch_serpapi("q", 5, workspace=tmp_path, opener=_opener({"error": "Invalid API key."}))
+    # The request still reached serpapi.com and got a response back, so it counts.
+    assert read_serpapi_usage().call_count == 1
+
+
+def test_serpapi_usage_does_not_increment_on_transport_failure(monkeypatch, tmp_path):
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+    exc = HTTPError("url", 429, "Too Many Requests", None, None)
+    with pytest.raises(ScholarProviderError):
+        _fetch_serpapi("q", 5, workspace=tmp_path, opener=_raising_opener(exc))
+    # Never reached serpapi.com with a completed round trip, so it doesn't count.
+    assert read_serpapi_usage().call_count == 0
+
+
+def test_serpapi_skips_request_once_monthly_limit_reached(monkeypatch, tmp_path):
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+    monkeypatch.setenv("SERPAPI_MONTHLY_LIMIT", "1")
+
+    def _opener_that_must_not_be_called(_request):
+        raise AssertionError("SerpApi should not be contacted once the monthly limit is reached")
+
+    _fetch_serpapi("q", 5, workspace=tmp_path, opener=_opener({"organic_results": []}))
+    assert read_serpapi_usage().call_count == 1
+
+    with pytest.raises(ScholarProviderError, match="monthly usage limit reached"):
+        _fetch_serpapi("q2", 5, workspace=tmp_path, opener=_opener_that_must_not_be_called)
+    assert read_serpapi_usage().call_count == 1
+
+
+def test_serpapi_monthly_limit_env_var_overrides_free_plan_default(monkeypatch, tmp_path):
+    monkeypatch.setenv("SERPAPI_MONTHLY_LIMIT", "5000")
+    usage = read_serpapi_usage()
+    assert usage.monthly_limit == 5000
 
 
 # --------------------------------------------------------------------------
@@ -417,6 +493,16 @@ def test_service_falls_through_to_semantic_scholar_when_serpapi_key_missing(monk
     statuses = {attempt.provider: attempt.status for attempt in response.attempts}
     assert statuses["serpapi"] == "error"
     assert statuses["semantic_scholar"] == "ok"
+
+
+def test_service_serpapi_attempt_detail_includes_usage_stats(monkeypatch, tmp_path):
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+    service = ScholarDataService(workspace=tmp_path, opener=_opener({"organic_results": []}))
+    response = service.search("container logistics")
+
+    assert response.provider_used == "serpapi"
+    serpapi_attempt = next(attempt for attempt in response.attempts if attempt.provider == "serpapi")
+    assert "SerpApi usage: 1/250 this month" in serpapi_attempt.detail
 
 
 def test_service_stops_at_first_successful_provider_even_with_zero_results(monkeypatch, tmp_path):

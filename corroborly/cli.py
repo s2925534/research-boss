@@ -189,7 +189,7 @@ from corroborly.engine.institutional_access import (
 )
 from corroborly.engine.report_schemas import export_report_schemas
 from corroborly.engine.reports import generate_workspace_report
-from corroborly.engine.scholar_providers import ScholarDataService
+from corroborly.engine.scholar_providers import ScholarDataService, read_serpapi_usage
 from corroborly.engine.sidecars import import_sidecar_metadata
 from corroborly.engine.vault import (
     compare_document_versions,
@@ -2216,6 +2216,47 @@ def search_scholar(
             color = "green" if attempt.status == "ok" else "red"
             console.print(f"  [{color}]{attempt.provider}: {attempt.status}[/{color}] - {attempt.detail}")
         console.print(f"[green]Wrote[/green] {snapshot_path}")
+        usage = read_serpapi_usage()
+        if usage.call_count:
+            if usage.limit_reached:
+                console.print(
+                    f"[red]SerpApi monthly limit reached ({usage.call_count}/{usage.monthly_limit} for "
+                    f"{usage.month})[/red] -- further `search scholar` runs will skip straight to the free "
+                    "fallback providers until next month, or set SERPAPI_MONTHLY_LIMIT if you're on a paid plan."
+                )
+            elif usage.percent_used >= 80:
+                console.print(
+                    f"[yellow]SerpApi usage at {usage.percent_used:.0f}% of the monthly cap "
+                    f"({usage.call_count}/{usage.monthly_limit} for {usage.month})[/yellow] -- consider raising "
+                    "--max-results per search instead of running many narrow ones, to make the remaining "
+                    f"{usage.remaining} search(es) count."
+                )
+
+
+@search_app.command("scholar-usage")
+def search_scholar_usage(
+    quiet: bool = typer.Option(False, "--quiet", help="Reduce console output."),
+) -> None:
+    """Show this month's tracked SerpApi call count against its monthly cap (not workspace-scoped --
+    a SerpApi key's quota is one account-wide resource). 250/month is SerpApi's free-plan cap; set
+    SERPAPI_MONTHLY_LIMIT if you're on a paid plan with a different one."""
+    usage = read_serpapi_usage()
+    if quiet:
+        return
+    console.print(
+        f"SerpApi usage for {usage.month}: {usage.call_count}/{usage.monthly_limit} "
+        f"({usage.percent_used:.0f}%), {usage.remaining} remaining"
+    )
+    if usage.limit_reached:
+        console.print(
+            "[red]Monthly limit reached[/red] -- `search scholar` will skip SerpApi and fall through to the "
+            "free providers until next month, or set SERPAPI_MONTHLY_LIMIT if you're on a paid plan."
+        )
+    elif usage.percent_used >= 80:
+        console.print(
+            "[yellow]Approaching the monthly cap[/yellow] -- consider batching queries or raising "
+            "--max-results per search rather than running many narrow searches."
+        )
 
 
 @institutional_app.command("login")

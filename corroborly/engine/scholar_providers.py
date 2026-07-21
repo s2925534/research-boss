@@ -18,6 +18,11 @@ the last-resort fallback tier: if every paid/scraped/stubbed option above
 fails or lacks credentials, the pipeline still returns real results instead
 of an empty response.
 
+Option 1 (SerpApi) is metered -- 250 searches/month on the free plan -- so
+every call is tracked locally against that cap (see `read_serpapi_usage`,
+`SerpApiUsage`) and skipped once reached rather than risking an unexpected
+overage; `SERPAPI_MONTHLY_LIMIT` overrides the cap for a paid plan.
+
 This module is intentionally self-contained: it does not import from, or
 get imported by, `corroborly.engine.external_search` (the existing
 Scopus-based provider, which has its own heavier candidate-register
@@ -32,6 +37,7 @@ import logging
 import os
 import re
 from dataclasses import asdict, dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -39,6 +45,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 from xml.etree import ElementTree
 
+from corroborly.core.yamlio import read_yaml, write_yaml
 from corroborly.engine.ai import load_dotenv_values
 
 logger = logging.getLogger(__name__)
@@ -135,6 +142,117 @@ def _http_get_json(request: Request, *, opener: Opener | None, provider_label: s
 
 
 # --------------------------------------------------------------------------
+# SerpApi usage tracking
+#
+# SerpApi bills/rate-limits per account, not per workspace or per API key
+# use site -- 250 searches/month on their free plan. Corroborly can't read
+# SerpApi's own billing dashboard, so this keeps a local, honest estimate:
+# every request that got a JSON response back from serpapi.com (a completed
+# round trip, whether the search itself succeeded or SerpApi returned an
+# error payload) counts as one used search. A transport-level failure that
+# never reached their servers does not count, since it can't have consumed
+# quota. Treat this as directionally accurate, not a substitute for
+# SerpApi's own dashboard.
+# --------------------------------------------------------------------------
+
+SERPAPI_DEFAULT_MONTHLY_LIMIT = 250  # SerpApi's free-tier plan cap.
+
+
+def serpapi_usage_path() -> Path:
+    """Where SerpApi call counts are tracked -- deliberately outside any
+    single workspace, since a SerpApi key's monthly quota is one
+    account-wide resource shared across every workspace, not a per-workspace
+    one. `CORROBORLY_SERPAPI_USAGE_PATH` overrides the default
+    `~/.corroborly/serpapi-usage.yaml`, same override pattern as
+    `CORROBORLY_TEMPLATES_ROOT`.
+    """
+    override = os.environ.get("CORROBORLY_SERPAPI_USAGE_PATH")
+    path = Path(override).expanduser() if override else Path.home() / ".corroborly" / "serpapi-usage.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _serpapi_monthly_limit() -> int:
+    """250/month is SerpApi's free-tier cap. Paid plans have a different
+    (usually much higher) cap -- set SERPAPI_MONTHLY_LIMIT to match yours."""
+    raw = os.environ.get("SERPAPI_MONTHLY_LIMIT")
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            logger.warning(
+                "Ignoring invalid SERPAPI_MONTHLY_LIMIT=%r, using the free-plan default of %d",
+                raw,
+                SERPAPI_DEFAULT_MONTHLY_LIMIT,
+            )
+    return SERPAPI_DEFAULT_MONTHLY_LIMIT
+
+
+def _current_month_key(*, now: datetime | None = None) -> str:
+    return (now or datetime.now(timezone.utc)).strftime("%Y-%m")
+
+
+@dataclass(frozen=True)
+class SerpApiUsage:
+    month: str
+    call_count: int
+    monthly_limit: int
+
+    @property
+    def remaining(self) -> int:
+        return max(0, self.monthly_limit - self.call_count)
+
+    @property
+    def percent_used(self) -> float:
+        return round(100 * self.call_count / self.monthly_limit, 1) if self.monthly_limit else 0.0
+
+    @property
+    def limit_reached(self) -> bool:
+        return self.call_count >= self.monthly_limit
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "month": self.month,
+            "call_count": self.call_count,
+            "monthly_limit": self.monthly_limit,
+            "remaining": self.remaining,
+            "percent_used": self.percent_used,
+            "limit_reached": self.limit_reached,
+        }
+
+
+def read_serpapi_usage(*, now: datetime | None = None) -> SerpApiUsage:
+    """Current calendar month's tracked SerpApi call count against its cap."""
+    path = serpapi_usage_path()
+    month = _current_month_key(now=now)
+    limit = _serpapi_monthly_limit()
+    if not path.is_file():
+        return SerpApiUsage(month=month, call_count=0, monthly_limit=limit)
+    data = read_yaml(path)
+    months = data.get("months") if isinstance(data.get("months"), dict) else {}
+    record = months.get(month) if isinstance(months.get(month), dict) else {}
+    return SerpApiUsage(month=month, call_count=int(record.get("call_count") or 0), monthly_limit=limit)
+
+
+def _record_serpapi_call(*, now: datetime | None = None) -> SerpApiUsage:
+    path = serpapi_usage_path()
+    month = _current_month_key(now=now)
+    limit = _serpapi_monthly_limit()
+    data = read_yaml(path) if path.is_file() else {}
+    months = data.get("months") if isinstance(data.get("months"), dict) else {}
+    previous = months.get(month) if isinstance(months.get(month), dict) else {}
+    call_count = int(previous.get("call_count") or 0) + 1
+    timestamp = (now or datetime.now(timezone.utc)).isoformat()
+    months[month] = {
+        "call_count": call_count,
+        "first_call_at": previous.get("first_call_at") or timestamp,
+        "last_call_at": timestamp,
+    }
+    write_yaml(path, {"version": 1, "months": months})
+    return SerpApiUsage(month=month, call_count=call_count, monthly_limit=limit)
+
+
+# --------------------------------------------------------------------------
 # Option 1: SerpApi (Google Scholar engine)
 # --------------------------------------------------------------------------
 
@@ -150,9 +268,28 @@ def _fetch_serpapi(
     if not api_key:
         raise ScholarProviderError("Missing SERPAPI_API_KEY")
 
+    usage = read_serpapi_usage()
+    if usage.limit_reached:
+        raise ScholarProviderError(
+            f"SerpApi monthly usage limit reached ({usage.call_count}/{usage.monthly_limit} for {usage.month}) "
+            "-- skipping to avoid unexpected overage charges. Set SERPAPI_MONTHLY_LIMIT if this is a paid plan "
+            "with a higher cap."
+        )
+
     params = {"engine": "google_scholar", "q": query, "api_key": api_key, "num": max_results}
     request = Request(f"{SERPAPI_URL}?{urlencode(params)}", headers={"Accept": "application/json"}, method="GET")
     data = _http_get_json(request, opener=opener, provider_label="SerpApi")
+    usage = _record_serpapi_call()
+    if usage.percent_used >= 80:
+        logger.warning(
+            "SerpApi usage at %.0f%% of the monthly cap (%d/%d for %s) -- consider raising --max-results per "
+            "search instead of running many narrow searches, or letting the free fallback providers handle "
+            "exploratory queries.",
+            usage.percent_used,
+            usage.call_count,
+            usage.monthly_limit,
+            usage.month,
+        )
 
     if isinstance(data, dict) and data.get("error"):
         raise ScholarProviderError(f"SerpApi error: {data['error']}")
@@ -594,7 +731,11 @@ class ScholarDataService:
                 attempts.append(ProviderAttempt(provider=name, status="error", detail=f"unexpected error: {exc}"))
                 continue
 
-            attempts.append(ProviderAttempt(provider=name, status="ok", detail=f"{len(results)} result(s)"))
+            detail = f"{len(results)} result(s)"
+            if name == "serpapi":
+                usage = read_serpapi_usage()
+                detail += f" (SerpApi usage: {usage.call_count}/{usage.monthly_limit} this month, {usage.percent_used:.0f}%)"
+            attempts.append(ProviderAttempt(provider=name, status="ok", detail=detail))
             return ScholarSearchResponse(
                 query=normalized_query,
                 provider_used=name,

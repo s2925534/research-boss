@@ -1063,6 +1063,78 @@ def test_cli_search_scholar_reports_failure_without_crashing_when_all_providers_
     assert snapshot["provider_used"] is None
 
 
+def test_cli_search_scholar_usage_reports_zero_with_no_usage_file(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setenv("CORROBORLY_SERPAPI_USAGE_PATH", str(tmp_path / "serpapi-usage.yaml"))
+
+    result = runner.invoke(app, ["search", "scholar-usage"])
+
+    assert result.exit_code == 0, result.output
+    assert "0/250" in result.output
+
+
+def test_cli_search_scholar_usage_warns_near_monthly_cap(tmp_path: Path, monkeypatch) -> None:
+    from corroborly.engine.scholar_providers import _current_month_key
+
+    usage_path = tmp_path / "serpapi-usage.yaml"
+    monkeypatch.setenv("CORROBORLY_SERPAPI_USAGE_PATH", str(usage_path))
+    write_yaml(usage_path, {"version": 1, "months": {_current_month_key(): {"call_count": 210}}})
+
+    result = runner.invoke(app, ["search", "scholar-usage"])
+
+    assert result.exit_code == 0, result.output
+    assert "210/250" in result.output
+    assert "Approaching the monthly cap" in result.output
+
+
+def test_cli_search_scholar_warns_when_serpapi_usage_near_cap(tmp_path: Path, monkeypatch) -> None:
+    from corroborly.engine.scholar_providers import (
+        ProviderAttempt,
+        ScholarResult,
+        ScholarSearchResponse,
+        _current_month_key,
+    )
+
+    workspace = tmp_path / "workspace"
+    init_workspace(workspace, project_name="Test", project_type="M.Phil", topic="Topic")
+    usage_path = tmp_path / "serpapi-usage.yaml"
+    monkeypatch.setenv("CORROBORLY_SERPAPI_USAGE_PATH", str(usage_path))
+    write_yaml(usage_path, {"version": 1, "months": {_current_month_key(): {"call_count": 200}}})
+
+    class FakeScholarDataService:
+        def __init__(self, *, workspace=None, opener=None):
+            pass
+
+        def search(self, query, *, max_results=10):
+            return ScholarSearchResponse(
+                query=query,
+                provider_used="serpapi",
+                results=[
+                    ScholarResult(
+                        title="Some Paper",
+                        authors=[],
+                        year=2024,
+                        citation_count=0,
+                        url=None,
+                        abstract=None,
+                        venue=None,
+                        source_provider="serpapi",
+                    )
+                ],
+                attempts=[ProviderAttempt(provider="serpapi", status="ok", detail="1 result(s)")],
+            )
+
+    monkeypatch.setattr(cli, "ScholarDataService", FakeScholarDataService)
+
+    result = runner.invoke(
+        app,
+        ["search", "scholar", "container logistics", "--workspace", str(workspace), "--external-search"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "SerpApi usage at" in result.output
+    assert "80%" in result.output
+
+
 def test_cli_institutional_login_requires_opt_in_flag(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     init_workspace(workspace, project_name="Test", project_type="M.Phil", topic="Topic")
