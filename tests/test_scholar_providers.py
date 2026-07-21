@@ -102,6 +102,10 @@ def test_serpapi_raises_without_api_key(monkeypatch, tmp_path):
 
 
 def test_serpapi_parses_organic_results(monkeypatch, tmp_path):
+    # Fixture shape matches a real live SerpApi google_scholar response,
+    # verified 2026-07-21 against https://serpapi.com/google-scholar-api's
+    # documented schema and a live account: "Authors - Venue, Year -
+    # Publisher", with a resources[] entry carrying the direct PDF link.
     monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
     data = {
         "organic_results": [
@@ -110,9 +114,12 @@ def test_serpapi_parses_organic_results(monkeypatch, tmp_path):
                 "link": "https://example.com/paper1",
                 "snippet": "An abstract about terminals.",
                 "publication_info": {
-                    "summary": "A Author, B Author - 2021 - Journal of Ports",
+                    "summary": "A Author, B Author - Journal of Ports, 2021 - Elsevier",
                     "authors": [{"name": "A Author"}, {"name": "B Author"}],
                 },
+                "resources": [
+                    {"title": "example.com", "file_format": "PDF", "link": "https://example.com/paper1.pdf"}
+                ],
                 "inline_links": {"cited_by": {"total": 42}},
             }
         ]
@@ -124,7 +131,30 @@ def test_serpapi_parses_organic_results(monkeypatch, tmp_path):
     assert result.authors == ["A Author", "B Author"]
     assert result.year == 2021
     assert result.citation_count == 42
+    assert result.venue == "Journal of Ports"
+    assert result.pdf_url == "https://example.com/paper1.pdf"
     assert result.source_provider == "serpapi"
+
+
+def test_serpapi_leaves_venue_none_when_summary_has_no_venue(monkeypatch, tmp_path):
+    # Real shape seen live: authors - year - host domain, with no venue at
+    # all. A bare host isn't a venue, so this must stay None, not guess.
+    monkeypatch.setenv("SERPAPI_API_KEY", "test-key")
+    data = {
+        "organic_results": [
+            {
+                "title": "A Survey Paper",
+                "link": "https://example.com/paper2",
+                "publication_info": {
+                    "summary": "C Author, D Author - 2019 - digital.example.edu",
+                    "authors": [{"name": "C Author"}],
+                },
+            }
+        ]
+    }
+    results = _fetch_serpapi("q", 5, workspace=tmp_path, opener=_opener(data))
+    assert results[0].venue is None
+    assert results[0].pdf_url is None
 
 
 def test_serpapi_raises_on_api_error_payload(monkeypatch, tmp_path):

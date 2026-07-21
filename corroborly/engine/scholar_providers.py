@@ -81,6 +81,7 @@ class ScholarResult:
     venue: str | None
     source_provider: str
     doi: str | None = None
+    pdf_url: str | None = None
 
 
 @dataclass(frozen=True)
@@ -119,6 +120,26 @@ def _env_value(key: str, *, workspace: Path | None) -> str:
 def _extract_year(text: Any) -> int | None:
     match = re.search(r"\b(19|20)\d{2}\b", str(text or ""))
     return int(match.group(0)) if match else None
+
+
+def _extract_venue_from_summary(summary: Any) -> str | None:
+    """Best-effort venue extraction from a SerpApi `publication_info.summary`
+    string like "N Sharma, R Sharma - Global Transitions Proceedings, 2021 -
+    Elsevier" (venue "Global Transitions Proceedings") or "G Nguyen, S
+    Dlugolinsky... - 2019 - digital.csic.es" (no venue, just year and host).
+    Finds the first " - "-delimited segment containing a year and strips the
+    year and its comma; if nothing meaningful remains (the segment was just
+    the year, as in the second example), returns None rather than guessing
+    -- a bare host/publisher name is not a venue."""
+    parts = [part.strip() for part in str(summary or "").split(" - ")]
+    if len(parts) < 2:
+        return None
+    for part in parts[1:]:
+        match = re.search(r"(19|20)\d{2}", part)
+        if match:
+            venue = (part[: match.start()] + part[match.end():]).strip(" ,")
+            return venue or None
+    return None
 
 
 def _safe_int_or_none(value: Any) -> int | None:
@@ -305,6 +326,15 @@ def _fetch_serpapi(
         authors_list = publication_info.get("authors") if isinstance(publication_info.get("authors"), list) else []
         inline_links = entry.get("inline_links") if isinstance(entry.get("inline_links"), dict) else {}
         cited_by = inline_links.get("cited_by") if isinstance(inline_links.get("cited_by"), dict) else {}
+        resources = entry.get("resources") if isinstance(entry.get("resources"), list) else []
+        pdf_url = next(
+            (
+                str(resource["link"])
+                for resource in resources
+                if isinstance(resource, dict) and str(resource.get("file_format") or "").upper() == "PDF" and resource.get("link")
+            ),
+            None,
+        )
         results.append(
             ScholarResult(
                 title=str(entry.get("title") or "Untitled"),
@@ -313,8 +343,9 @@ def _fetch_serpapi(
                 citation_count=_safe_int_or_none(cited_by.get("total")),
                 url=entry.get("link"),
                 abstract=entry.get("snippet"),
-                venue=None,
+                venue=_extract_venue_from_summary(publication_info.get("summary")),
                 source_provider="serpapi",
+                pdf_url=pdf_url,
             )
         )
     return results
