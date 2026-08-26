@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 import sys
 from pathlib import Path
 from typing import Optional
@@ -235,6 +236,9 @@ from corroborly.engine.zotero import (
 from corroborly.engine.zotero_api import (
     ZoteroApiError,
     clear_zotero_api_credentials,
+    create_zotero_collection,
+    mirror_items_to_zotero_collection,
+    require_zotero_write_access,
     save_zotero_api_credentials,
     zotero_api_collections,
     zotero_api_credentials,
@@ -5450,6 +5454,138 @@ def zotero_api_collections_cmd(
     for collection in collections:
         table.add_row(str(collection.get("key")), str(collection.get("name")), str(collection.get("parent_key") or ""))
     console.print(table)
+
+
+@zotero_app.command("api-write-check")
+def zotero_api_write_check(
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="Workspace path (default: CWD)"),
+    log_level: str = typer.Option("info", "--log-level", help="debug|info|warning|error"),
+    quiet: bool = typer.Option(False, "--quiet", help="Reduce console output (still logs/run summary)."),
+):
+    """Check whether the linked Zotero Web API key has write access (read-only network call)."""
+    ws = _resolve_workspace(workspace)
+    _slug, logger, summary, summary_path, _log_path = _run_ctx(["zotero", "api_write_check"], ws, log_level)
+    try:
+        credentials = zotero_api_credentials(ws)
+        report = zotero_api_readiness(credentials)
+    except ZoteroApiError as e:
+        logger.error("Zotero API write check failed", operation="zotero_api_write_check", error=str(e))
+        summary.errors += 1
+        _finish(summary, summary_path)
+        if not quiet:
+            console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    output_path = ws / "outputs" / "validation" / "zotero-api-write-check.yaml"
+    write_yaml(output_path, report)
+    logger.info(
+        "Checked Zotero Web API write access",
+        operation="zotero_api_write_check",
+        key_has_write_access=report["key_has_write_access"],
+    )
+    _finish(summary, summary_path)
+    if quiet:
+        return
+    if report["key_has_write_access"]:
+        console.print("[green]Write access available.[/green] The linked key can create collections and items via the Web API.")
+    else:
+        console.print(
+            "[red]No write access.[/red] Create a key with 'Allow write access' at "
+            "https://www.zotero.org/settings/keys and re-link with `corroborly zotero api-link`."
+        )
+
+
+@zotero_app.command("collection-create")
+def zotero_collection_create(
+    name: str = typer.Argument(..., help="Name of the collection to create in the Web API library."),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="Workspace path (default: CWD)"),
+    apply: bool = typer.Option(False, "--apply", help="Actually create it. Without this flag the command is a dry run."),
+    log_level: str = typer.Option("info", "--log-level", help="debug|info|warning|error"),
+    quiet: bool = typer.Option(False, "--quiet", help="Reduce console output (still logs/run summary)."),
+):
+    """Create a Zotero collection via the Web API (opt-in write; never touches local Zotero files)."""
+    ws = _resolve_workspace(workspace)
+    _slug, logger, summary, summary_path, _log_path = _run_ctx(["zotero", "collection_create"], ws, log_level)
+    if not apply:
+        _finish(summary, summary_path, next_action="Re-run with --apply to create the collection.")
+        if not quiet:
+            console.print(f"[yellow]Dry run.[/yellow] Would create collection '{name}'. Re-run with --apply.")
+        return
+    try:
+        credentials = zotero_api_credentials(ws)
+        require_zotero_write_access(credentials)
+        created = create_zotero_collection(credentials, name)
+    except ZoteroApiError as e:
+        logger.error("Zotero collection create failed", operation="zotero_collection_create", error=str(e))
+        summary.errors += 1
+        _finish(summary, summary_path)
+        if not quiet:
+            console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    logger.info("Created Zotero collection", operation="zotero_collection_create", collection_key=created["key"])
+    _finish(summary, summary_path)
+    if not quiet:
+        console.print(f"[green]Created[/green] collection '{created['name']}' (key {created['key']}).")
+
+
+@zotero_app.command("mirror")
+def zotero_mirror(
+    items_json: Path = typer.Argument(..., help="Path to a JSON file: a list of Zotero item objects to mirror."),
+    collection: str = typer.Option(..., "--collection", help="Target collection name (created if absent)."),
+    workspace: Optional[Path] = typer.Option(None, "--workspace", "-w", help="Workspace path (default: CWD)"),
+    apply: bool = typer.Option(False, "--apply", help="Actually write. Without this flag the command is a dry run."),
+    log_level: str = typer.Option("info", "--log-level", help="debug|info|warning|error"),
+    quiet: bool = typer.Option(False, "--quiet", help="Reduce console output (still logs/run summary)."),
+):
+    """Mirror a list of Zotero item objects into a single collection via the Web API.
+
+    Idempotent: a re-run reuses the collection and skips items already present
+    (matched by DOI, url or title). Opt-in write; never touches local Zotero files.
+    """
+    ws = _resolve_workspace(workspace)
+    _slug, logger, summary, summary_path, _log_path = _run_ctx(["zotero", "mirror"], ws, log_level)
+    try:
+        items = json.loads(items_json.read_text(encoding="utf-8"))
+        if not isinstance(items, list):
+            raise ZoteroApiError("The items JSON file must contain a list of item objects.")
+    except (OSError, json.JSONDecodeError) as e:
+        logger.error("Zotero mirror could not read items", operation="zotero_mirror", error=str(e))
+        summary.errors += 1
+        _finish(summary, summary_path)
+        if not quiet:
+            console.print(f"[red]Could not read items JSON: {e}[/red]")
+        raise typer.Exit(code=2)
+    if not apply:
+        _finish(summary, summary_path, next_action="Re-run with --apply to write to Zotero.")
+        if not quiet:
+            console.print(f"[yellow]Dry run.[/yellow] Would mirror {len(items)} item(s) into '{collection}'. Re-run with --apply.")
+        return
+    try:
+        credentials = zotero_api_credentials(ws)
+        report = mirror_items_to_zotero_collection(credentials, collection, items)
+    except ZoteroApiError as e:
+        logger.error("Zotero mirror failed", operation="zotero_mirror", error=str(e))
+        summary.errors += 1
+        _finish(summary, summary_path)
+        if not quiet:
+            console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    output_path = ws / "outputs" / "validation" / "zotero-mirror-report.yaml"
+    write_yaml(output_path, {"version": 1, **{k: v for k, v in report.items()}})
+    logger.info(
+        "Mirrored items into Zotero collection",
+        operation="zotero_mirror",
+        collection_key=report["collection"]["key"],
+        created=len(report["created"]),
+        skipped=len(report["skipped"]),
+        failed=len(report["failed"]),
+    )
+    _finish(summary, summary_path)
+    if not quiet:
+        console.print(
+            f"[green]Mirrored[/green] into '{report['collection']['name']}': "
+            f"{len(report['created'])} created, {len(report['skipped'])} skipped (already present), "
+            f"{len(report['failed'])} failed."
+        )
 
 
 @zotero_app.command("api-select-collections")

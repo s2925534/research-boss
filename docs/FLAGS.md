@@ -57,7 +57,12 @@ no override:
 - No flag sends an original source file, whole PDF/CSV/SQLite database, or a
   full document to an AI provider by default — only `build_safe_context`
   excerpts, always capped, always logged in the response's `limits` field.
-- No flag ever writes into a linked Zotero directory (read-only, always).
+- No flag ever writes into the user's local Zotero directory (`zotero.sqlite`,
+  `storage/`) — that boundary is absolute. Zotero Web API writes
+  (`zotero collection-create`, `zotero mirror`) are a separate, explicitly
+  opt-in capability that mutates the server-side library through
+  https://api.zotero.org only, never the local files, and each requires an
+  explicit `--apply` plus a write-scoped key.
 - No flag makes an AI feature skip the `insufficient_evidence` guard or the
   `grounding` check (`corroborly.engine.grounding`, Phase 27) — these run
   unconditionally whenever AI is used, not opt-in behavior themselves.

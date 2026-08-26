@@ -8,13 +8,34 @@ from corroborly.engine.zotero_api import (
     ZoteroApiCredentials,
     ZoteroApiError,
     clear_zotero_api_credentials,
+    create_zotero_collection,
+    create_zotero_items,
     load_dotenv_values,
+    mirror_items_to_zotero_collection,
+    require_zotero_write_access,
     save_zotero_api_credentials,
     write_dotenv_values,
     zotero_api_collections,
     zotero_api_credentials,
     zotero_api_readiness,
 )
+
+CREDS = ZoteroApiCredentials(api_key="secret", user_id="42")
+
+
+class RouterOpener:
+    """Dispatches a fake response by (method, url) predicate, for multi-call tests."""
+
+    def __init__(self, routes):
+        self.routes = routes  # list of (predicate, data)
+        self.calls = []
+
+    def __call__(self, request: Request):
+        self.calls.append((request.get_method(), request.full_url))
+        for predicate, data in self.routes:
+            if predicate(request):
+                return FakeResponse(data)
+        raise AssertionError(f"no route for {request.get_method()} {request.full_url}")
 
 
 class FakeResponse:
@@ -129,3 +150,85 @@ def test_zotero_api_requires_json_response() -> None:
 
     with pytest.raises(ZoteroApiError, match="invalid JSON"):
         zotero_api_readiness(ZoteroApiCredentials(api_key="secret", user_id="42"), opener=lambda _request: BadResponse())
+
+
+def test_create_zotero_collection_returns_saved_key() -> None:
+    def opener(request: Request):
+        assert request.get_method() == "POST"
+        assert request.full_url.endswith("/users/42/collections")
+        assert request.headers.get("Zotero-write-token")  # idempotency token set
+        body = json.loads(request.data.decode("utf-8"))
+        assert body == [{"name": "AES", "parentCollection": False}]
+        return FakeResponse(
+            {"successful": {"0": {"key": "NEWKEY", "data": {"key": "NEWKEY", "name": "AES"}}}, "failed": {}}
+        )
+
+    assert create_zotero_collection(CREDS, "AES", opener=opener) == {"key": "NEWKEY", "name": "AES"}
+
+
+def test_create_zotero_collection_raises_on_failed() -> None:
+    def opener(_request: Request):
+        return FakeResponse({"successful": {}, "failed": {"0": {"code": 400, "message": "bad"}}})
+
+    with pytest.raises(ZoteroApiError, match="rejected the collection"):
+        create_zotero_collection(CREDS, "AES", opener=opener)
+
+
+def test_require_write_access_raises_for_read_only_key() -> None:
+    def opener(_request: Request):
+        return FakeResponse({"access": {"user": {"library": True, "write": False}}})
+
+    with pytest.raises(ZoteroApiError, match="does not have write access"):
+        require_zotero_write_access(CREDS, opener=opener)
+
+
+def test_create_zotero_items_maps_success() -> None:
+    def opener(request: Request):
+        assert request.get_method() == "POST"
+        assert request.full_url.endswith("/users/42/items")
+        return FakeResponse({"success": {"0": "ITEMKEY"}, "unchanged": {}, "failed": {}})
+
+    out = create_zotero_items(CREDS, [{"itemType": "preprint", "title": "X"}], opener=opener)
+    assert out["created"] == {"0": "ITEMKEY"}
+    assert out["failed"] == {}
+
+
+def test_mirror_creates_new_and_skips_existing_and_assigns_collection() -> None:
+    posted_body = {}
+
+    def is_keys(r: Request) -> bool:
+        return r.get_method() == "GET" and "/keys/" in r.full_url
+
+    def is_collections(r: Request) -> bool:
+        return r.get_method() == "GET" and r.full_url.endswith("/users/42/collections?limit=100")
+
+    def is_coll_items(r: Request) -> bool:
+        return r.get_method() == "GET" and "/collections/COL1/items" in r.full_url
+
+    def is_post_items(r: Request) -> bool:
+        posted = r.get_method() == "POST" and r.full_url.endswith("/users/42/items")
+        if posted:
+            posted_body["items"] = json.loads(r.data.decode("utf-8"))
+        return posted
+
+    router = RouterOpener(
+        [
+            (is_keys, {"access": {"user": {"library": True, "write": True}}}),
+            (is_collections, [{"key": "COL1", "version": 1, "data": {"name": "AES", "parentCollection": False}}]),
+            (is_coll_items, [{"data": {"DOI": "10.1/existing", "title": "Existing"}}]),
+            (is_post_items, {"success": {"0": "NEWITEM"}, "unchanged": {}, "failed": {}}),
+        ]
+    )
+
+    items = [
+        {"itemType": "journalArticle", "title": "Existing", "DOI": "10.1/existing"},  # deduped -> skipped
+        {"itemType": "preprint", "title": "New", "url": "https://arxiv.org/abs/2607.10059"},  # created
+    ]
+    report = mirror_items_to_zotero_collection(CREDS, "AES", items, opener=router)
+
+    assert report["collection"] == {"key": "COL1", "name": "AES", "created": False}
+    assert report["skipped"] == ["Existing"]
+    assert report["attempted"] == 1
+    assert report["created"] == {"0": "NEWITEM"}
+    # the created item was assigned to the target collection
+    assert posted_body["items"][0]["collections"] == ["COL1"]

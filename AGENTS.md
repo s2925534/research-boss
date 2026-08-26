@@ -41,6 +41,7 @@ Do not start FastAPI, UI, packaging, or OpenAI-heavy features until their engine
 - Never modify anything inside the user's local Zotero directory. This applies to current CLI workflows, development workflows, tests, and any future AI implementation.
 - Zotero-derived files such as reports, snapshots, BibTeX exports, metadata, and converted text must be written only inside the Corroborly workspace.
 - Future AI modes that read whole files, directories, or full papers must be explicit opt-in settings and must still preserve the Zotero no-write boundary.
+- Zotero Web API writes are a distinct, explicitly opt-in capability, separate from the local no-write rule above. `corroborly zotero collection-create` and `corroborly zotero mirror` may create collections and items through https://api.zotero.org using a write-scoped API key. They never read from or write to the user's local Zotero directory (`zotero.sqlite`, `storage/`), so the local no-write boundary in the first bullet is unchanged and remains absolute. Every such write requires an explicit `--apply` flag and a key that passes `corroborly zotero api-write-check`; a read-only key is refused with remediation guidance.
 - Every AI mode, current or future, must also preserve the "Core Rule: No Hallucinations" above — grounded-only output, explicit refusal on insufficient evidence, no exceptions.
 - Do not print or log API keys.
 - Keep `.env` ignored.
