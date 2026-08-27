@@ -4,6 +4,7 @@ import json
 import os
 import uuid
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
@@ -11,6 +12,11 @@ from urllib.request import Request, urlopen
 
 
 ZOTERO_API_BASE_URL = "https://api.zotero.org"
+
+# Cap every Web API call so a stalled connection raises URLError instead of
+# hanging indefinitely (applies only to the real urlopen; injected openers,
+# e.g. in tests, are used as-is).
+ZOTERO_API_TIMEOUT_SECONDS = 30
 
 
 @dataclass(frozen=True)
@@ -132,7 +138,7 @@ def zotero_api_get(
         },
         method="GET",
     )
-    fetch = opener or urlopen
+    fetch = opener or partial(urlopen, timeout=ZOTERO_API_TIMEOUT_SECONDS)
     try:
         with fetch(request) as response:
             return json.loads(response.read().decode("utf-8"))
@@ -239,7 +245,7 @@ def zotero_api_post(
         headers["If-Unmodified-Since-Version"] = str(if_unmodified_since_version)
     data = json.dumps(body).encode("utf-8")
     request = Request(url, data=data, headers=headers, method="POST")
-    fetch = opener or urlopen
+    fetch = opener or partial(urlopen, timeout=ZOTERO_API_TIMEOUT_SECONDS)
     try:
         with fetch(request) as response:
             raw = response.read().decode("utf-8")
